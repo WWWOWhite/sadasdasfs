@@ -3,7 +3,7 @@ import numpy as np
 import torch
 video1_path = 'D:\\videoFile\\32.31.250.103\\20240501_20240501125647_20240501140806_125649.mp4'
 import time
-
+import csv
 
 normal_lane_count = 0
 emergency_lane_count = 0
@@ -33,163 +33,155 @@ def get_video_info(video_path):
 
 
 def pic_test(normal_lane_count=normal_lane_count, emergency_lane_count=emergency_lane_count):
-    prev_time = time.time()  # 帧计数器
-
     # 定义识别线线的起点和终点坐标
     line_start = np.array([100, 250])  # 起点
     line_end = np.array([1000, 250])  # 终点
 
+    # 水平线的y值，表示车辆是否通过
+    horizontal_line_y = 500
+
+    # 初始化参数
+    normal_lane_total_count = 0  # 正常车道通过车辆总数
+    emergency_lane_total_count = 0  # 应急车道通过车辆总数
+    tracked_vehicles = {}
+
     counter = 0  # 计数器
-    counter_id = 0  # 分配唯一 ID 的计数器
     buffer_tracks = {}  # 保存位置和时间的元组
     crossed_boxes = {}  # 用于存储每个框的交叉状态的字典
     identification_range = 30  # 识别范围
+    counter_id = 0  # 分配唯一 ID 的计数器
+    previous_positions = {}
 
-    max_track_length = 35  # 最大轨迹长度
-    track_timeout = 10  # 轨迹超时时间（秒）
+    # 视频的时间加速倍数
+    time_scale_factor = 10  # 视频是10倍速
 
-    unupdated_timeout = 0.1  # 未更新的轨迹存在时间（秒）
-    last_updated = {}  # 初始化 last_updated 字典
+    # 时间和速度的设置
+    fps = 25  # 视频实际帧率为25帧每秒
+    scaling_factor = 0.05  # 像素到实际距离的缩放比例 (1像素 = 0.05米)
+    road_length_km = 0.5  # 道路长度的估计，假设为0.5公里
 
+    # 车辆总数和流量的时间跟踪
+    start_time = time.time()
 
-    cap = cv2.VideoCapture(video1_path)
-    # 水平线的y值，表示车辆是否通过
-    horizontal_line_y = 500  # 假设横轴的y值为400，用作判断车辆是否通过
-    # 存储已通过的车辆ID
-    tracked_vehicles = {}
-    # 车道车辆计数器
-    normal_lane_total_count = 0
-    emergency_lane_total_count = 0
+    with open('speed.csv', mode='a', newline='', encoding='utf-8') as file:
+        writer = csv.writer(file)
+        writer.writerow(['frame_num', 'speed_kmh'])
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
+        cap = cv2.VideoCapture(video1_path)
+        frame_num = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            frame_num += 1
+            if not ret:
+                break
 
-        # 定义斜线的两个端点坐标 (x1, y1) 和 (x2, y2)，假设这条线划分了应急车道和正常车道
-        point1 = (104, 604)  # 起点
-        point2 = (476, 328)  # 终点
-        # 计算分界线的斜率
-        slope = (point2[1] - point1[1]) / (point2[0] - point1[0])  # (y2 - y1) / (x2 - x1)
+            # 定义斜线的两个端点坐标 (x1, y1) 和 (x2, y2)，假设这条线划分了应急车道和普通车道
+            point1 = (104, 604)  # 起点
+            point2 = (476, 328)  # 终点
+            # 计算分界线的斜率
+            slope = (point2[1] - point1[1]) / (point2[0] - point1[0])  # (y2 - y1) / (x2 - x1)
 
-        # 计算分界线的截距：y = slope * x + intercept
-        intercept = point1[1] - slope * point1[0]
+            # 计算分界线的截距：y = slope * x + intercept
+            intercept = point1[1] - slope * point1[0]
 
-        # 绘制分界线
-        cv2.line(frame, point1, point2, (0, 255, 0), 2)
-        cv2.line(frame, (0, horizontal_line_y), (frame.shape[1], horizontal_line_y), (0, 0, 255), 2)
-        # 使用YOLOv5模型检测车辆
-        results = model(frame)
-        detected_boxes = results.xyxy[0].numpy()  # 获取检测框
+            # 绘制分界线
+            cv2.line(frame, point1, point2, (0, 255, 0), 2)
+            cv2.line(frame, (0, horizontal_line_y), (frame.shape[1], horizontal_line_y), (0, 0, 255), 2)
 
-        # 车辆检测后的处理
-        for box in detected_boxes:
-            x1, y1, x2, y2, confidence, cls = box  # 获取边界框的坐标和类别
-            # center = np.array([(box[0] + box[2]) / 2, (box[1] + box[3]) / 2], dtype=int)
-            center = np.array( [box[2], box[3]], dtype=int)
+            # 使用YOLOv5模型检测车辆
+            results = model(frame)
+            detected_boxes = results.xyxy[0].numpy()  # 获取检测框
 
-            cv2.circle(frame, tuple(center), radius=5, color=(0, 255, 255), thickness=-1)
+            # 车辆检测后的处理
+            for box in detected_boxes:
+                x1, y1, x2, y2, confidence, cls = box  # 获取检测框的坐标和类别
+                center = np.array([box[2], box[3]], dtype=int)  # 使用车辆右下角作为中心点
 
-            cv2.line(frame, tuple(line_start), tuple(line_end), color=(255, 0, 255), thickness=6)
+                box_id = None
 
-            # 检查框 ID 是否已存在于缓冲区中
-            box_id = None
-            for id, past_positions in buffer_tracks.items():
-                if len(past_positions) > 0 and np.linalg.norm(
-                        past_positions[-1][0] - center) < identification_range:  # 如果 y 位置接近缓冲区中的 1
-                    box_id = id
-                    break
-            '''
-            这段代码是用于判断当前的识别框（box）是否在之前的帧中已经识别过。
-            在这段代码中，buffer_y_positions是一个字典，它的键是识别框的ID，值是该识别框在过去的帧中所有的y坐标位置。
-            这段代码的目标是尝试找到一个已经存在于buffer_y_positions的识别框ID，使得该识别框在上一帧的y坐标位置与当前识别框的y坐标位置非常接近（差距小于30像素）。如果找到了这样的ID，则认为当前的识别框在之前的帧中已经识别过，于是将box_id设置为这个ID，并跳出循环。
-            这种做法的目的是尽可能地追踪每一个识别框的运动，即使在连续的帧中，由于摄像设备的振动或者物体的移动速度等原因，相同的物体可能被检测出稍微不同的识别框。通过将新的识别框和旧的识别框相关联，我们可以对物体的运动进行追踪，例如判断物体何时穿过了一条特定的线。
-            '''
+                # 在缓冲区中寻找之前的车辆ID
+                for id, past_positions in buffer_tracks.items():
+                    if len(past_positions) > 0 and np.linalg.norm(past_positions[-1][0] - center) < identification_range:
+                        box_id = id
+                        break
 
-            if box_id is None:
-                # 为盒子分配一个新的 ID
-                box_id = counter_id
-                counter_id += 1
-                buffer_tracks[box_id] = []
-                crossed_boxes[box_id] = False  # 将交叉状态初始化为 False
+                if box_id is None:
+                    # 为新检测到的车辆分配唯一 ID
+                    box_id = counter_id
+                    counter_id += 1
+                    buffer_tracks[box_id] = []
+                    crossed_boxes[box_id] = False
+                #
+                buffer_tracks[box_id].append((center, time.time()))  # 记录位置和时间
+                previous_positions[box_id] = buffer_tracks[box_id][-1][0]
 
-            buffer_tracks[box_id].append((center, time.time()))  # 添加位置和当前时间
-            last_updated[box_id] = time.time()  # 更新时间
+                # 计算车速（修正计算）
+                speed_kph = 0  # 初始化速度为0
+                if box_id in previous_positions and len(buffer_tracks[box_id]) > 1:
+                    prev_x, prev_y = previous_positions[box_id]
+                    displacement_pixels = np.linalg.norm(np.array([center[0] - buffer_tracks[box_id][-2][0][0], center[1] - buffer_tracks[box_id][-2][0][1]]))
+                    print(center[0],buffer_tracks[box_id][-2][0][0])
+                    # 限定位置
+                    if buffer_tracks[box_id][-2][0][1]>300 and center[1] < 300:
+                        if displacement_pixels > 0:  # 避免速度为0的情况
+                            displacement_meters = displacement_pixels * scaling_factor
+                            speed_mps = displacement_meters * fps * time_scale_factor  # 速度：米/秒 (调整为实际速度)
+                            speed_mps = displacement_meters * 25
+                            speed_kph = speed_mps * 3.6  # 转换为公里/小时
+                            # 写入表中  frame_num | speed_kph
+                            row = [frame_num,speed_kph]
+                            writer.writerow(row)
 
-            # 检查框是否越界
-            if len(buffer_tracks[box_id]) > 1:
-                if (buffer_tracks[box_id][-2][0][1] - line_start[1]) * (
-                        buffer_tracks[box_id][-1][0][1] - line_start[1]) < 0:
-                    # 盒子已经越界了
-                    crossed_boxes[box_id] = True  # 更新交叉状态为 True
-                    center_x = buffer_tracks[box_id][-1][0][0]
-                    center_y = buffer_tracks[box_id][-1][0][1]
-                    line_y_at_center_x = slope * center_x + intercept  # 分界线在center_x位置的y值
-                    if center_y < line_y_at_center_x:  # 在普通车道
-                        normal_lane_total_count += 1
-                    else:  # 在应急车道
-                        emergency_lane_total_count += 1
-                    counter +=1
-                    print(buffer_tracks[box_id])
+                # 在车辆检测框上显示速度
+                cv2.putText(frame, f'Speed: {speed_kph:.2f} km/h', (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                            (255, 255, 255), 2)
 
-            # 如果框被标记为已越线，则绘制文本
-            if crossed_boxes[box_id]:
-                cv2.putText(frame, 'crossed', (center[0], center[1] - 20), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                            (0, 255, 0), 2)
+                # 检查是否越过水平线
+                if len(buffer_tracks[box_id]) > 1:
+                    if (buffer_tracks[box_id][-2][0][1] - line_start[1]) * (
+                            buffer_tracks[box_id][-1][0][1] - line_start[1]) < 0:
+                        # 车辆越过了水平线，记录车道
+                        center_x = buffer_tracks[box_id][-1][0][0]
+                        center_y = buffer_tracks[box_id][-1][0][1]
+                        line_y_at_center_x = slope * center_x + intercept  # 分界线在 center_x 位置的 y 值
+                        if center_y < line_y_at_center_x:  # 在普通车道
+                            normal_lane_total_count += 1
+                        else:  # 在应急车道
+                            emergency_lane_total_count += 1
+                        counter += 1
 
-            # # 获取车辆的中心x坐标
-            # center_x = (x1 + x2) / 2
-            # center_y = (y1 + y2) / 2
-            # # 判断车辆是在应急车道还是正常车道
-            # # 判断在斜线的上方还是下方
-            # # 检查车辆是否已经被跟踪
-            # vehicle_id = f"{int(center_x)}_{int(center_y)}"  # 创建车辆的唯一ID（可以基于位置）
-            # # 判断车辆是否通过水平线
-            # if vehicle_id not in tracked_vehicles and center_y > horizontal_line_y:
-            #     # 判断车辆是在应急车道还是普通车道
-            #     line_y_at_center_x = slope * center_x + intercept  # 分界线在center_x位置的y值
-            #     if center_y < line_y_at_center_x:  # 在普通车道
-            #         normal_lane_total_count += 1
-            #         tracked_vehicles[vehicle_id] = 'normal'  # 记录该车辆已经通过
-            #     else:  # 在应急车道
-            #         emergency_lane_total_count += 1
-            #         tracked_vehicles[vehicle_id] = 'emergency'
-            #
-            # # 绘制车辆检测框
-            # cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            # cv2.putText(frame, f'Vehicle {confidence:.2f}', (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
-            #             (255, 255, 255), 2)
+                # 绘制车辆检测框
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
 
-            # 显示车道车辆总计数
+            # 计算车流密度：检测到的车辆数量 / 道路长度
+            vehicle_density = len(buffer_tracks) / road_length_km
 
+            # 计算车流量（每小时通过虚拟线的车辆数）
+            elapsed_time = time.time() - start_time  # 计算经过的时间
+            if elapsed_time > 0:
+                vehicle_flow = (counter / elapsed_time) * 3600  # 将流量转换为每小时的值
+            else:
+                vehicle_flow = 0
 
-        for id, track in list(buffer_tracks.items()):
-            if len(track) > max_track_length:  # 如果轨迹过长
-                track.pop(0)  # 移除最旧的位置
-            if time.time() - track[-1][1] > track_timeout:  # 如果轨迹过期
-                del buffer_tracks[id]  # 删除整个轨迹
+            # 显示普通车道和应急车道的总数
+            cv2.putText(frame, f"Normal Lane: {normal_lane_total_count}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                        (255, 0, 0), 2)
+            cv2.putText(frame, f"Emergency Lane: {emergency_lane_total_count}", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                        (255, 0, 0), 2)
 
-        for id in list(buffer_tracks.keys()):
-            if time.time() - last_updated[id] > unupdated_timeout:  # 如果轨迹过期
-                del buffer_tracks[id]  # 删除整个轨迹
-                del last_updated[id]  # 删除对应的时间
+            # 显示车流量和车流密度
+            cv2.putText(frame, f"Vehicle Flow (per hour): {vehicle_flow:.2f}", (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                        (0, 255, 0), 2)
+            cv2.putText(frame, f"Vehicle Density (vehicles/km): {vehicle_density:.2f}", (50, 200), cv2.FONT_HERSHEY_SIMPLEX,
+                        1,
+                        (0, 255, 0), 2)
 
+            # 显示当前帧
+            cv2.imshow('YOLOv5 Detection', frame)
 
-        counter_str = 'Counter: %s' % counter
-        cv2.putText(frame, counter_str, (5, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (34, 139, 34), 2)  # 将计数器放在框架上
-
-        cv2.putText(frame, f"Normal Lane Total: {normal_lane_total_count}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                    (255, 0, 0), 2)
-        cv2.putText(frame, f"Emergency Lane Total: {emergency_lane_total_count}", (50, 100), cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    (255, 0, 0), 2)
-
-        # 显示当前帧
-        cv2.imshow('YOLOv5 Detection', frame)
-
-        # 按 'q' 键退出
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            # 按 'q' 键退出
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
     cap.release()
     cv2.destroyAllWindows()
@@ -252,6 +244,19 @@ def process_video(video_path):
     cap.release()
     cv2.destroyAllWindows()
 
+def get_scale_mouse_callback(event, x, y, flags, param):
+    global points
+    if event == cv2.EVENT_LBUTTONDOWN:  # 当左键按下时，记录点
+        points.append((x, y))
+        cv2.circle(frame, (x, y), 5, (0, 255, 0), -1)  # 在点的位置绘制一个圆
+        if len(points) == 2:
+            cv2.line(frame, points[0], points[1], (255, 0, 0), 2)  # 连接两个点的线
+            pixel_distance = ((points[1][0] - points[0][0]) ** 2 + (points[1][1] - points[0][1]) ** 2) ** 0.5
+            print(f"像素距离: {pixel_distance:.2f} 像素")
+            points = []  # 清空点列表，准备重新计算
+
+
+
 
 if __name__ == '__main__':
     # image = cv2.imread("C:\\Users\\79295\Desktop\\QQ20240921-091306.png")
@@ -283,4 +288,32 @@ if __name__ == '__main__':
 
     # pic_test()
     # get_video_info(video1_path)
+    # pic_test()
+
+    ## 计算两点之间像素
+    # cap = cv2.VideoCapture(video1_path)
+    #
+    # # 读取视频的第一帧
+    # ret, frame = cap.read()
+    #
+    # if not ret:
+    #     print("无法读取视频帧")
+    #     cap.release()
+    #     exit()
+    #
+    # # 回调函数，用于鼠标点击获取两个点并计算距离
+    # points = []
+    #
+    #
+    # cv2.imshow("Frame", frame)
+    #
+    # # 显示视频的第一帧
+    # cv2.imshow("Frame", frame)
+    # cv2.setMouseCallback("Frame", get_scale_mouse_callback)
+    #
+    # # 等待用户按键退出
+    # cv2.waitKey(0)
+    # cap.release()
+    # cv2.destroyAllWindows()
+
     pic_test()
